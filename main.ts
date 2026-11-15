@@ -1,109 +1,93 @@
-// free-model-aggregator-02's starter kit: one server, two client wires, and a real free model behind
-// every answer.
+// free-model-aggregator-02: one server, two client wires, and a real free model behind every answer.
 //
-// This is a working entry to start from, not a competitive answer. It is the house baseline for the
-// bounty, deliberately weak, and worth a fraction of the score: use it to see the shape of a trial, then
-// replace its routing, its failover and its catalog with your own. The gaps are marked TODO below.
+// A trial runs this file as `node main.ts` from the repository root on Node 22's standard library alone.
+// The env is at $MAKEFUN_ENV_URL; every model call goes through the gateway at $OPENAI_BASE_URL on the
+// trial's stand-in key. The brief at $MAKEFUN_PROMPT_FILE carries the fourteen free OpenRouter models
+// (with the house's published rating and capabilities) and the six prompt rows, in the order the client
+// sends them.
 //
-// WHAT A TRIAL GIVES YOU
-//   A trial runs this server as `node /bot/main.ts` from your repository's root, with Node 22's standard
-//   library alone (nothing is installed; TypeScript runs directly, and a relative import needs its .ts
-//   extension). The env is at $MAKEFUN_ENV_URL; your model calls go through the grader's gateway at
-//   $OPENAI_BASE_URL, an OpenAI-compatible endpoint that reaches OpenRouter on the key you pushed to the
-//   competition. The brief at $MAKEFUN_PROMPT_FILE carries two documents:
-//     - the free model list: each free OpenRouter model's gateway id
-//       (`openrouter/<vendor>/<model>:free`), its published rating in milli-points, what it can do
-//       (tools, vision, JSON mode, context length) and its free flag;
-//     - the six prompts: each one's id, its api (openai or anthropic), whether it streams, its weight
-//       (1 or 2) and the requirements a model must meet to serve it. Each prompt carries a unique token
-//       the answer must contain.
-//   The server:
-//     1. listens on 0.0.0.0 at a free port (never 8080: the env itself is there on one layout);
-//     2. POSTs $MAKEFUN_ENV_URL/register {"protocol_version": 1, "port": <port>, "catalog": <catalog>};
-//     3. serves GET /v1/models (answering in the shape of the auth header it got: x-api-key means
-//        Anthropic, Authorization means OpenAI), POST /v1/chat/completions and POST /v1/messages, each
-//        with a JSON body or with server-sent events;
-//     4. answers each prompt by dialling ONE free model through the gateway. OPENAI_API_KEY in the
-//        sandbox is a dummy the gateway swaps for the OpenRouter key you pushed; the real key never
-//        enters the sandbox;
-//     5. polls GET $MAKEFUN_ENV_URL/work every 100 ms and exits 0 when the env says {"done": true}. A
-//        process still running when the wall ends scores zero, so never wait for anything else.
-//   `node main.ts --list` prints the same catalog JSON and exits 0 before any server starts; the
-//   register body's catalog is that same document, byte for byte.
+// Routing, in one sentence: for each request, keep the free models that meet the prompt's published
+// requirements, order them by rating_milli best first, dial the best, and on a refusal or an answer that
+// omits the prompt's token cool that model down against a logical call counter and move to the next.
 //
-// THE MODEL RULE
-//   Whatever this server reports in a response's `model` field must be the model it actually dialled.
-//   The house records every gateway call and scores the model that really answered. This starter sends
-//   the brief's model id in the gateway request and puts that same id back on every answer and every
-//   streamed chunk (the provider's own answer spells it without the gateway's `openrouter/` prefix), so
-//   its claim is the call it made, never another. A prompt whose reported model has no matching
-//   successful call in the house's record earns nothing.
+// The entry:
+//   1. listens on 0.0.0.0 at a free ephemeral port (never 8080, which the env owns on one layout);
+//   2. POSTs $MAKEFUN_ENV_URL/register {"protocol_version":1,"port":<port>,"catalog":<catalog>};
+//   3. serves GET /v1/models in the shape the auth header names, POST /v1/chat/completions (OpenAI) and
+//      POST /v1/messages (Anthropic), each in JSON or server-sent events as the request asks;
+//   4. answers each prompt by dialling a free model on the gateway's Chat Completions route and returning
+//      the gateway's answer in the client's wire, with the dialled model named on every answer and chunk;
+//   5. polls GET $MAKEFUN_ENV_URL/work and exits 0 when the env says done.
 //
-// THE BASELINE'S WEAKNESSES (each is a scoring component you can win)
-//   - quality (60%): it ignores the published ratings. It takes the first free model in the brief, in
-//     the brief's order, that can meet the request's requirements. TODO(quality): rank the free
-//     candidates by rating_milli at the prompt's requirements and prefer the best.
-//   - failover (10%): a gateway call answered with a 4xx or a 5xx becomes a 502 to the client, and that
-//     prompt is lost. TODO(failover): retry the prompt on the next free model that meets it, and count
-//     every call it costs, because the tie-break is the number of gateway calls.
-//   - rate limits: after a 429 it keeps picking the same first model, so one rate-limited model takes
-//     every later prompt down with it. TODO(cooldowns): track each model's refusals and back off per
-//     model, and never spend a call on a model that is cooling down.
-//   - the catalog (5%): it lists every free model the brief names, which is exactly the fourteen ids
-//     this column scores. TODO(catalog): keep it exact — register that same set and answer GET /v1/models
-//     with it on both auth headers; the column checks the register body and both answers against exactly
-//     those fourteen ids, so listing fewer loses it as surely as listing more.
-//   The trial's rules are in the kit's RULES.txt; read them for the score's columns and the tie-break.
+// `node main.ts --list` prints the catalog document and exits 0 before any server starts; the register
+// body's catalog is that same document, byte for byte.
 //
-// FILES
-//   main.ts            this server: the brief, the catalog, the routes, the register and the poll.
-//   lib/providers.ts   the brief's types and parser, the free model list, the catalog.
-//   lib/wire.ts        Anthropic <-> Chat Completions translation, the model field, the SSE writers.
-//   LICENSE            MIT: keep it or replace it with another OSI-approved license.
+// THE DETERMINISM RULE
+//   Nothing that differs between two runs may reach a request. This file never reads the clock into a
+//   gateway or env request and never draws a random number. The only clock reads are the local budgets
+//   that bound a wedged call; the route itself is a function of the brief, the request bodies and the
+//   gateway's answers. Cooldowns are counted in gateway calls, not seconds, so a replay makes the same
+//   choices from the same answers.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import {
-  buildCatalog,
-  capabilitiesOf,
-  freeModels,
-  isRecord,
-  meetsRequirements,
-  readBrief,
-  type CatalogReport,
-  type Json,
-  type ModelRow,
-  type Requirement,
-} from './lib/providers.ts';
+import { createServer } from 'node:http';
+import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import { buildCatalog, freeModels, isRecord, meetsRequirement, readBrief } from './lib/brief.ts';
+import type { Brief, CatalogReport, Json, ModelRow, Requirement } from './lib/brief.ts';
 import {
   anthropicError,
-  anthropicEventsFromOpenAI,
   anthropicModelList,
-  anthropicToOpenAI,
+  anthropicUpstreamBody,
+  declaredToolNames,
   openAIError,
-  openAIJsonWithModel,
   openAIModelList,
-  openAIStreamWithModel,
-  openAIToAnthropic,
-  type ServedModel,
+  openAIUpstreamBody,
+  parseUpstreamAnswer,
+  refusalCode,
+  renderAnthropicJson,
+  renderAnthropicStream,
+  renderOpenAIJson,
+  renderOpenAIStream,
+  shorthand,
+  tokenOf,
 } from './lib/wire.ts';
+import type { FailureRow, ServedModel, UpstreamAnswer } from './lib/wire.ts';
 
-/** The wire protocol's version, in the register body. */
+/** The wire protocol version in the register body. */
 const PROTOCOL_VERSION = 1;
 /** How often GET /work is polled, in milliseconds. */
 const POLL_INTERVAL_MS = 100;
-/** How long one gateway call may take before the next free model is tried. */
-const DIAL_TIMEOUT_MS = 12_000;
-/** The most bytes of one client request body this baseline reads. */
+/** The most bytes of one client request body this entry reads. */
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
+/**
+ * The per-attempt gateway timeout, in milliseconds, indexed by attempt number. It is a fixed schedule,
+ * never a wall-clock budget: a live pass and its instant replay make the same attempt choices. The sum
+ * is 28 s, inside the client's 30 s window, and fast refusals never spend their timeout.
+ */
+const CALL_TIMEOUTS_MS = [12_000, 8_000, 4_000, 2_000, 1_000, 1_000];
+/** The most gateway calls one prompt may make, so a bad day cannot exhaust the trial's 60-call cap. */
+const MAX_ATTEMPTS = CALL_TIMEOUTS_MS.length;
+/** The most refusal rows the optional trail header may carry. */
+const MAX_TRAIL_ROWS = 8;
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 const GATEWAY_URL = (process.env.OPENAI_BASE_URL ?? '').replace(/\/+$/, '');
-/** The trial's dummy key for the entry's gateway lane; the gateway swaps it for the entrant's own key. */
+/** The trial's stand-in key; the gateway swaps it for the entrant's OpenRouter key, which never enters here. */
 const GATEWAY_KEY = process.env.OPENAI_API_KEY ?? '';
 
-const brief = readBrief(PROMPT_FILE);
+const brief: Brief = readBrief(PROMPT_FILE);
 const catalog: CatalogReport = buildCatalog(brief);
+/** The free models, each id once, in the brief's order; the router re-orders per request. */
+const free = freeModels(brief);
+const modelById = new Map(free.map((model) => [model.id, model]));
+/** What GET /v1/models lists: exactly the catalog's models, each id once. */
+const servedModels: ServedModel[] = catalog.providers.flatMap((provider) =>
+  provider.models.map((model) => ({
+    id: model.id,
+    provider: 'openrouter',
+    display_name: modelById.get(model.id)?.display_name ?? model.id,
+  })),
+);
 /** Which prompt row the request now arriving is: the brief's prompts are in the client's arrival order. */
 let manifestIndex = 0;
 
@@ -111,68 +95,242 @@ function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
 }
 
-/**
- * The gateway's Chat Completions route. OPENAI_BASE_URL is the OpenAI-compatible root (`…/v1` on the
- * trial network); a base that does not already end in `/v1` gets one, so both spellings reach the route.
- */
+/** The gateway's Chat Completions route. OPENAI_BASE_URL is the `…/v1` root on the trial network. */
 function chatCompletionsUrl(): string {
   if (GATEWAY_URL === '') return '';
   return GATEWAY_URL.endsWith('/v1') ? `${GATEWAY_URL}/chat/completions` : `${GATEWAY_URL}/v1/chat/completions`;
 }
 
-/** The free models the brief lists, as GET /v1/models names them. */
-function servedModels(): ServedModel[] {
-  return freeModels(brief).map((model) => ({ id: model.id, provider: model.provider, display_name: model.display_name }));
-}
+// ---------------------------------------------------------------------------------------------
+// Routing: the best published rating that meets the prompt's requirements, best first.
+// ---------------------------------------------------------------------------------------------
 
-/** The token a prompt's answer must carry: a capitalised word and four digits, as the brief spells it. */
-const TOKEN_RE = /\b[A-Z]{2,}-\d{4}\b/;
-
-function tokenOf(body: Json): string | null {
-  const match = TOKEN_RE.exec(JSON.stringify(body.messages ?? ''));
-  return match === null ? null : match[0];
-}
-
-/**
- * Refusals are remembered against a logical call counter, never the wall clock: a replay must make the
- * same choices from the same answers. A model cooling down is skipped rather than called again, so one
- * rate-limited model cannot take the later prompts down with it.
- */
-const coolingUntil = new Map<string, number>();
-let gatewayCalls = 0;
-const COOLDOWN_CALLS = 3;
-
-/** Every free model that meets the requirements, best published rating first, skipping cooled-down ones. */
+/** Every free model that meets the requirements, best published rating first, id as the stable tie-break. */
 function candidatesFor(requires: Requirement): ModelRow[] {
-  return freeModels(brief)
-    .filter((model) => meetsRequirements(requires, capabilitiesOf(model)))
-    .filter((model) => (coolingUntil.get(model.id) ?? 0) <= gatewayCalls)
+  return free
+    .filter((model) => meetsRequirement(requires, model))
     .sort((a, b) => b.rating_milli - a.rating_milli || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cooldowns, counted in gateway calls so a replay makes the same choices.
+// ---------------------------------------------------------------------------------------------
+
+/** Model id -> the first logical call number at which it is available again (exclusive bound). */
+const coolingUntil = new Map<string, number>();
+/** Model id -> how many refusals it has produced; a second refusal cools it down for longer. */
+const failureCounts = new Map<string, number>();
+/** The logical call counter. It never depends on the clock. */
+let gatewayCalls = 0;
+
+function isCooling(modelId: string): boolean {
+  return (coolingUntil.get(modelId) ?? 0) > gatewayCalls;
+}
+
+/** Mark a refused call: the model is skipped while a better-behaved candidate remains. */
+function markRefusal(modelId: string, status: number): void {
+  const count = (failureCounts.get(modelId) ?? 0) + 1;
+  failureCounts.set(modelId, count);
+  // A rate limit (429) is cheap to re-probe on a later prompt: it rests one logical call. A wedged
+  // call (timeout or network error) costs the full 12 s, so it rests longer. A 5xx rests in between.
+  // Each further refusal of the same model lengthens the rest, up to a bounded extra.
+  const base = status === 429 ? 1 : status === 0 ? 4 : 2;
+  const extra = base + Math.min(count - 1, 3);
+  coolingUntil.set(modelId, gatewayCalls + extra);
+}
+
+/** A successful call clears the model's record: it is behaving again. */
+function markSuccess(modelId: string): void {
+  coolingUntil.delete(modelId);
+  failureCounts.delete(modelId);
+}
+
+/** An answer that omitted the prompt's token is kept as a last resort, and the model rests one call. */
+function markTokenMiss(modelId: string): void {
+  coolingUntil.set(modelId, gatewayCalls + 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Requirements: the brief's row for the arriving prompt, or the body's own shape when there is none.
+// ---------------------------------------------------------------------------------------------
+
+function requirementsFromBody(body: Json): Requirement {
+  const requires: Requirement = {};
+  if (Array.isArray(body.tools) && body.tools.length > 0) requires.tools = true;
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  for (const message of messages) {
+    if (!isRecord(message) || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (isRecord(block) && (block.type === 'image' || block.type === 'image_url')) requires.vision = true;
+    }
+  }
+  if (isRecord(body.response_format)) {
+    const type = body.response_format.type;
+    if (type === 'json_object' || type === 'json_schema') requires.json = true;
+  }
+  return requires;
 }
 
 /** The requirements of the prompt now arriving: the brief's row by arrival order, else the body's own. */
 function requirementsFor(body: Json): Requirement {
-  const entry = brief.prompts[manifestIndex];
+  const row = brief.prompts[manifestIndex];
   manifestIndex += 1;
-  if (entry !== undefined) return entry.requires;
+  if (row !== undefined) return row.requires;
   return requirementsFromBody(body);
 }
 
-/** Requirements read off a request body, when the brief has no row for it. */
-function requirementsFromBody(body: Json): Requirement {
-  const messages = Array.isArray(body.messages) ? body.messages : [];
-  let vision = false;
-  for (const message of messages) {
-    if (!isRecord(message) || !Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      if (isRecord(block) && (block.type === 'image' || block.type === 'image_url')) vision = true;
-    }
-  }
-  const format = isRecord(body.response_format) ? body.response_format.type : undefined;
-  return { tools: Array.isArray(body.tools) && body.tools.length > 0, vision, json: format === 'json_object' || format === 'json_schema' };
+// ---------------------------------------------------------------------------------------------
+// One prompt: dial candidates until one answer carries the token (or keep the best answer as a fallback).
+// ---------------------------------------------------------------------------------------------
+
+type ServedResult =
+  | { kind: 'answer'; model: string; answer: UpstreamAnswer; trail: FailureRow[]; verified: boolean }
+  | { kind: 'none'; status: number; message: string };
+
+interface Prefix {
+  model: string;
+  answer: UpstreamAnswer;
 }
 
-/** One client request body, or null when it is not one JSON object or is too large. */
+async function serve(
+  wire: 'openai' | 'anthropic',
+  body: Json,
+  requires: Requirement,
+  token: string | null,
+  declared: readonly string[],
+): Promise<ServedResult> {
+  const all = candidatesFor(requires);
+  if (all.length === 0) {
+    return { kind: 'none', status: 503, message: 'no free model in the brief meets this request' };
+  }
+
+  const ready = all.filter((model) => !isCooling(model.id));
+  const resting = all.filter((model) => isCooling(model.id));
+  const tried = new Set<string>();
+  const trail: FailureRow[] = [];
+  let success: Prefix | null = null;
+  let fallback: Prefix | null = null;
+  let lastStatus = 504;
+  let lastText = 'no candidate answered before the attempt cap';
+  let attempts = 0;
+
+  const build = (modelId: string): Json =>
+    wire === 'openai' ? openAIUpstreamBody(body, modelId) : anthropicUpstreamBody(body, modelId);
+
+  const attempt = async (model: ModelRow): Promise<void> => {
+    if (tried.has(model.id) || attempts >= MAX_ATTEMPTS) return;
+    tried.add(model.id);
+    attempts += 1;
+    gatewayCalls += 1;
+    const timeout = CALL_TIMEOUTS_MS[Math.min(attempts - 1, CALL_TIMEOUTS_MS.length - 1)];
+
+    let upstream: Response;
+    try {
+      upstream = await fetch(chatCompletionsUrl(), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${GATEWAY_KEY}` },
+        body: JSON.stringify(build(model.id)),
+        signal: AbortSignal.timeout(timeout),
+      });
+    } catch (err) {
+      markRefusal(model.id, 0);
+      trail.push({ status: 504, code: 'timeout_or_network', model: model.id });
+      lastStatus = 504;
+      lastText = (err as Error).message;
+      return;
+    }
+
+    if (!upstream.ok) {
+      let text = '';
+      try {
+        text = await upstream.text();
+      } catch {
+        text = '';
+      }
+      markRefusal(model.id, upstream.status);
+      trail.push({ status: upstream.status, code: refusalCode(upstream.status, text), model: model.id });
+      lastStatus = upstream.status;
+      lastText = text;
+      return;
+    }
+
+    let raw: unknown;
+    try {
+      raw = await upstream.json();
+    } catch (err) {
+      markRefusal(model.id, 502);
+      trail.push({ status: 502, code: 'invalid_upstream_json', model: model.id });
+      lastStatus = 502;
+      lastText = (err as Error).message;
+      return;
+    }
+    if (!isRecord(raw)) {
+      markRefusal(model.id, 502);
+      trail.push({ status: 502, code: 'invalid_upstream_json', model: model.id });
+      lastStatus = 502;
+      lastText = 'the gateway answer is not one JSON object';
+      return;
+    }
+
+    const answer = parseUpstreamAnswer(raw, model.id, declared);
+    if (!answer.valid) {
+      markRefusal(model.id, 502);
+      trail.push({ status: 502, code: 'empty_completion', model: model.id });
+      lastStatus = 502;
+      lastText = 'the gateway answer holds no assistant message';
+      return;
+    }
+
+    markSuccess(model.id);
+    if (token === null || answer.text.includes(token)) {
+      success = { model: model.id, answer };
+      return;
+    }
+    // The model answered, but not with the prompt's token: keep the best such answer in reserve and
+    // try the next candidate, because a prompt whose answer omits its token scores nothing.
+    markTokenMiss(model.id);
+    if (fallback === null) fallback = { model: model.id, answer };
+  };
+
+  // First pass: the models that are not cooling down, best rating first.
+  for (const model of ready) {
+    if (success !== null) break;
+    await attempt(model);
+  }
+
+  // Last resort: models that were cooling down at the start of this prompt, best rating first.
+  if (success === null) {
+    for (const model of resting) {
+      if (success !== null) break;
+      await attempt(model);
+    }
+  }
+
+  if (success !== null) {
+    const served = success as Prefix;
+    return { kind: 'answer', model: served.model, answer: served.answer, trail, verified: true };
+  }
+  if (fallback !== null) {
+    const kept = fallback as Prefix;
+    return { kind: 'answer', model: kept.model, answer: kept.answer, trail: [], verified: false };
+  }
+  return { kind: 'none', status: lastStatus, message: shorthand(lastText, 500) };
+}
+
+/**
+ * The optional refusal trail, attached only to an answer that actually carries the prompt's token. The
+ * header is how the failover column sees a refusal this server recovered from; a reserve answer that
+ * did not carry the token is not a served prompt, so it is not reported as a recovered failover.
+ */
+function trailHeaders(result: { trail: FailureRow[]; verified: boolean }): Record<string, string> {
+  if (!result.verified || result.trail.length === 0) return {};
+  return { 'x-makefun-upstream-failures': JSON.stringify(result.trail.slice(0, MAX_TRAIL_ROWS)) };
+}
+
+// ---------------------------------------------------------------------------------------------
+// HTTP: body reading, responses, and the three scored routes.
+// ---------------------------------------------------------------------------------------------
+
 async function readJson(req: IncomingMessage): Promise<Json | null> {
   const chunks: Buffer[] = [];
   let size = 0;
@@ -191,157 +349,87 @@ async function readJson(req: IncomingMessage): Promise<Json | null> {
   }
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
   const text = JSON.stringify(body);
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': String(Buffer.byteLength(text)),
+    ...headers,
+  });
   res.end(text);
 }
 
-function sendError(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, type: string, message: string): void {
+function sendError(
+  res: ServerResponse,
+  wire: 'openai' | 'anthropic',
+  status: number,
+  type: string,
+  message: string,
+): void {
   if (wire === 'anthropic') sendJson(res, status, anthropicError(type, message));
   else sendJson(res, status, openAIError(message, type, null));
 }
 
 /** GET /v1/models, in the shape of the auth header the client sent. */
 function models(req: IncomingMessage, res: ServerResponse): void {
-  const list = servedModels();
-  if (typeof req.headers['x-api-key'] === 'string') sendJson(res, 200, anthropicModelList(list));
-  else sendJson(res, 200, openAIModelList(list));
-}
-
-/** POST one request to the gateway's Chat Completions route, naming the model this entry dialled. */
-async function dial(model: string, body: Json): Promise<Response> {
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-    authorization: `Bearer ${GATEWAY_KEY}`,
-  };
-  if (body.stream === true) headers.accept = 'text/event-stream';
-  // The client waits 30 s per answer: give up on a wedged call well inside that, so the next model runs.
-  return fetch(chatCompletionsUrl(), { method: 'POST', headers, body: JSON.stringify({ ...body, model }), signal: AbortSignal.timeout(DIAL_TIMEOUT_MS) });
-}
-
-/** A buffered upstream body back as a stream, so the wire writers below read it unchanged. */
-function streamOf(text: string): ReadableStream<Uint8Array> {
-  const bytes = new TextEncoder().encode(text);
-  return new ReadableStream({
-    start(controller) {
-      controller.enqueue(bytes);
-      controller.close();
-    },
-  });
-}
-
-type Served =
-  | { kind: 'json'; model: string; body: Json }
-  | { kind: 'stream'; model: string; text: string };
-
-type ServedOrGave = Served | { kind: 'none'; status: number; text: string };
-
-/**
- * Dial the best free model that meets the request, falling back down the ranking. A refusal cools the
- * model down and costs one call; an answer that leaves the prompt's token out is kept as a last resort
- * and the next model is tried, because a prompt only scores when its answer carries the token.
- */
-async function serve(
-  requires: Requirement,
-  wantsStream: boolean,
-  toUpstream: (model: string) => Json,
-  token: string | null,
-): Promise<ServedOrGave> {
-  const candidates = candidatesFor(requires);
-  if (candidates.length === 0) {
-    return { kind: 'none', status: 503, text: 'no free model in the brief meets this request' };
-  }
-  let jsonFallback: { model: string; body: Json } | null = null;
-  let streamFallback: { model: string; text: string } | null = null;
-  let lastStatus = 502;
-  let lastText = '';
-
-  for (const model of candidates) {
-    gatewayCalls += 1;
-    let upstream: Response;
-    try {
-      upstream = await dial(model.id, toUpstream(model.id));
-    } catch (err) {
-      coolingUntil.set(model.id, gatewayCalls + COOLDOWN_CALLS);
-      lastStatus = 502;
-      lastText = (err as Error).message;
-      continue;
-    }
-    if (!upstream.ok) {
-      coolingUntil.set(model.id, gatewayCalls + COOLDOWN_CALLS);
-      lastStatus = upstream.status;
-      lastText = await upstream.text().catch(() => '');
-      continue;
-    }
-    try {
-      if (wantsStream) {
-        const text = await upstream.text();
-        if (token === null || text.includes(token)) return { kind: 'stream', model: model.id, text };
-        streamFallback = streamFallback ?? { model: model.id, text };
-      } else {
-        const body: unknown = await upstream.json();
-        if (!isRecord(body)) {
-          lastStatus = 502;
-          lastText = 'the gateway answer is not one JSON object';
-          continue;
-        }
-        if (token === null || JSON.stringify(body).includes(token)) return { kind: 'json', model: model.id, body };
-        jsonFallback = jsonFallback ?? { model: model.id, body };
-      }
-    } catch (err) {
-      lastStatus = 502;
-      lastText = (err as Error).message;
-    }
-  }
-  if (jsonFallback !== null) return { kind: 'json', model: jsonFallback.model, body: jsonFallback.body };
-  if (streamFallback !== null) return { kind: 'stream', model: streamFallback.model, text: streamFallback.text };
-  return { kind: 'none', status: lastStatus, text: lastText };
-}
-
-/** A refused or broken gateway call as a 502 in the client's wire. */
-function refused(res: ServerResponse, wire: 'openai' | 'anthropic', status: number, text: string): void {
-  if (wire === 'anthropic') {
-    sendError(res, wire, 502, 'api_error', `the gateway answered HTTP ${status}${text === '' ? '' : `: ${text.slice(0, 500)}`}`);
-  } else {
-    sendError(res, wire, 502, 'upstream_error', `the gateway answered HTTP ${status}${text === '' ? '' : `: ${text.slice(0, 500)}`}`);
-  }
+  if (typeof req.headers['x-api-key'] === 'string') sendJson(res, 200, anthropicModelList(servedModels));
+  else sendJson(res, 200, openAIModelList(servedModels));
 }
 
 /** POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that meets it. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
-  if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  if (body === null) {
+    return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  }
   const requires = requirementsFor(body);
   const stream = body.stream === true;
   const token = tokenOf(body);
-  const served = await serve(requires, stream, (model) => ({ ...body, model }), token);
-  if (served.kind === 'none') return refused(res, 'openai', served.status, served.text);
-  if (served.kind === 'json') return sendJson(res, 200, openAIJsonWithModel(served.body, served.model));
-  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-  try {
-    for await (const frame of openAIStreamWithModel(streamOf(served.text), served.model)) res.write(frame);
-  } finally {
-    res.end();
+  const declared = declaredToolNames('openai', body);
+  const result = await serve('openai', body, requires, token, declared);
+  if (result.kind === 'none') {
+    return sendError(res, 'openai', result.status, 'upstream_error', result.message);
   }
+  const extra = trailHeaders(result);
+  if (!stream) {
+    return sendJson(res, 200, renderOpenAIJson(result.answer, result.model), extra);
+  }
+  const text = renderOpenAIStream(result.answer, result.model);
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+    ...extra,
+  });
+  res.end(text);
 }
 
-/** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
+/** POST /v1/messages: an Anthropic-shaped client, translated to Chat Completions and answered back. */
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
-  if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  if (body === null) {
+    return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  }
   const requires = requirementsFor(body);
   const stream = body.stream === true;
   const token = tokenOf(body);
-  const served = await serve(requires, stream, (model) => anthropicToOpenAI(body, model), token);
-  if (served.kind === 'none') return refused(res, 'anthropic', served.status, served.text);
-  if (served.kind === 'json') return sendJson(res, 200, openAIToAnthropic(served.body, served.model));
-  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-  try {
-    for await (const event of anthropicEventsFromOpenAI(streamOf(served.text), served.model)) res.write(event);
-  } finally {
-    res.end();
+  const declared = declaredToolNames('anthropic', body);
+  const result = await serve('anthropic', body, requires, token, declared);
+  if (result.kind === 'none') {
+    return sendError(res, 'anthropic', result.status, 'api_error', result.message);
   }
+  const extra = trailHeaders(result);
+  if (!stream) {
+    return sendJson(res, 200, renderAnthropicJson(result.answer, result.model), extra);
+  }
+  const text = renderAnthropicStream(result.answer, result.model);
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+    ...extra,
+  });
+  res.end(text);
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -358,7 +446,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     await messages(req, res);
     return;
   }
-  sendError(res, url.pathname === '/v1/messages' ? 'anthropic' : 'openai', 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
+  sendError(
+    res,
+    url.pathname === '/v1/messages' ? 'anthropic' : 'openai',
+    404,
+    'not_found',
+    `no route ${req.method ?? ''} ${url.pathname}`,
+  );
 }
 
 function listen(server: Server): Promise<void> {
@@ -376,9 +470,13 @@ async function register(port: number, report: CatalogReport): Promise<void> {
     body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
     signal: AbortSignal.timeout(5000),
   });
-  if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
-  const reply: unknown = await res.json();
-  if (isRecord(reply) && typeof reply.requests === 'number') log(`registered: the trial holds ${reply.requests} prompts`);
+  if (!res.ok) {
+    throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${shorthand(await res.text(), 500)}`);
+  }
+  const reply: unknown = await res.json().catch(() => null);
+  if (isRecord(reply) && typeof reply.requests === 'number') {
+    log(`registered: the trial holds ${reply.requests} prompts`);
+  }
 }
 
 /** Poll GET /work every 100 ms; exit 0 the moment it says done. */
@@ -410,7 +508,7 @@ async function start(): Promise<void> {
   if (brief.error !== null) log(brief.error);
   if (process.argv.includes('--list')) {
     // The same document the register body carries, byte for byte: print the one built object and stop
-    // before any server starts. A process whose stdout is not flushed loses the tail, so wait for it.
+    // before any server starts. Wait for the write callback so a non-file stdout cannot lose the tail.
     const text = `${JSON.stringify(catalog)}\n`;
     await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
     process.exit(0);
@@ -420,16 +518,26 @@ async function start(): Promise<void> {
   const server = createServer((req, res) => {
     void handle(req, res).catch((err: unknown) => {
       log((err as Error).stack ?? String(err));
-      if (!res.headersSent) sendError(res, req.url?.startsWith('/v1/messages') === true ? 'anthropic' : 'openai', 500, 'internal_error', 'the server failed to answer');
+      if (!res.headersSent) {
+        sendError(
+          res,
+          req.url?.startsWith('/v1/messages') === true ? 'anthropic' : 'openai',
+          500,
+          'internal_error',
+          'the server failed to answer',
+        );
+      } else {
+        res.end();
+      }
     });
   });
   await listen(server);
   const address = server.address();
   if (address === null || typeof address === 'string') throw new Error('the server has no port');
   const port = address.port;
-  // 8080 is the env's on one layout; the OS's ephemeral range never holds it, and the guard says so.
+  // 8080 is the env's on one layout; the OS's ephemeral range does not pick it, and the guard says so.
   if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
-  log(`listening on 0.0.0.0:${port} with ${servedModels().length} free models`);
+  log(`listening on 0.0.0.0:${port} with ${servedModels.length} free models`);
   await register(port, catalog);
   process.on('SIGTERM', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0));
