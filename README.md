@@ -28,21 +28,23 @@ in the order the client sends them. For each request the router:
 
 ### Refusals, cooldowns and failover
 
-A gateway answer that is not a 2xx, a network error, a timeout and a malformed or empty upstream body
-are all refusals. A refused model is cooled down and the next candidate is tried. Cooldowns are counted
-in gateway calls, never wall-clock seconds, so a replay makes the same choices from the same answers:
+A gateway answer that is not a 2xx, a network/transport error, and a malformed or empty upstream body
+are all refusals. A refused model is cooled down and the next candidate is tried.
+Cooldowns are counted in gateway calls, never wall-clock seconds, so a replay makes the same choices
+from the same answers:
 
 - a `429` (rate limit) rests one logical call, so a later prompt may re-probe it;
-- a timeout or network error rests four calls, because a wedged call has already spent 12 s;
+- a network/transport error rests four calls;
 - a 5xx or other 4xx rests two calls; each further refusal of the same model lengthens the rest.
 
 A model that answers successfully clears its record. Models that are cooling down are skipped while a
 non-cooling candidate remains; if every candidate is cooling, the best one is still used as a last
-resort, because an unserved prompt scores nothing. One prompt makes at most six attempts, with a fixed
-per-attempt timeout schedule of 12 s, 8 s, 4 s, 2 s, 1 s and 1 s (28 s in the worst case), so a wedged
-call cannot eat the client's 30 s window or the trial's 60-call cap. The schedule is a fixed function of
-the attempt number, never an elapsed-time budget, so a live pass and its instant replay make the same
-attempt choices.
+resort, because an unserved prompt scores nothing. One prompt makes at most six attempts. There is
+deliberately no timeout on a gateway dial: a timeout is a wall-clock decision, so live and replay could
+take different branches — the live pass moving on, the replay seeing the instant answer and staying on
+the model. A slow call is bounded by the client's own 30 s per-answer timeout, and an awaited call never
+blocks the event loop, so later prompts still run. The env's register and `/work` polls keep short local
+aborts; those are not model calls and cannot change the scored request sequence.
 
 ### The token check
 
@@ -103,11 +105,13 @@ polls `GET $MAKEFUN_ENV_URL/work` every 100 ms, exiting 0 when the env says done
 
 ## Determinism
 
-No wall clock is read into a gateway or env request and no unseeded randomness is used. The route is a
-function of the brief, the request bodies and the gateway's answers; cooldowns are counted in logical
-calls; model listings use a fixed `created` / `created_at`; the catalog's `base_url` is the provider's
-public endpoint. Two runs that see the same answers make the same calls and leave the same state
-export.
+No wall clock is read into a gateway or env request and no unseeded randomness is used. The gateway
+dial has no timeout, so a slow answer cannot make the live pass and its replay take different branches;
+the only timers are the short aborts on `POST /register` and the `GET /work` poll, which are not model
+calls. The route is a function of the brief, the request bodies and the gateway's answers; cooldowns are
+counted in logical calls; model listings use a fixed `created` / `created_at`; the catalog's `base_url`
+is the provider's public endpoint. Two runs that see the same answers make the same calls and leave the
+same state export.
 
 ## Verify locally
 

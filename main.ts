@@ -24,10 +24,11 @@
 //
 // THE DETERMINISM RULE
 //   Nothing that differs between two runs may reach a request. This file never reads the clock into a
-//   gateway or env request and never draws a random number. The only clock reads are the local budgets
-//   that bound a wedged call; the route itself is a function of the brief, the request bodies and the
-//   gateway's answers. Cooldowns are counted in gateway calls, not seconds, so a replay makes the same
-//   choices from the same answers.
+//   gateway or env request and never draws a random number. The gateway dial has no timeout at all: a
+//   timeout is a wall-clock decision, so live and replay could take different branches. The only timers
+//   left are the short aborts on POST /register and GET /work, which are not model calls and cannot
+//   change the scored request sequence. The route itself is a function of the brief, the request bodies
+//   and the gateway's answers; cooldowns are counted in gateway calls, not seconds.
 
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
@@ -59,13 +60,15 @@ const POLL_INTERVAL_MS = 100;
 /** The most bytes of one client request body this entry reads. */
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 /**
- * The per-attempt gateway timeout, in milliseconds, indexed by attempt number. It is a fixed schedule,
- * never a wall-clock budget: a live pass and its instant replay make the same attempt choices. The sum
- * is 28 s, inside the client's 30 s window, and fast refusals never spend their timeout.
+ * The most gateway calls one prompt may make, so a bad day cannot exhaust the trial's 60-call cap.
+ *
+ * There is deliberately no timeout on a gateway dial. A timeout is a wall-clock decision: live, a slow
+ * model would cross it and the router would move on; on replay the same call answers instantly and the
+ * branch would never be taken, so the request sequence would diverge. The route is a function of the
+ * brief, the requests and the gateway's answers only. A slow call is bounded by the client's own 30 s
+ * per-answer timeout, and an awaited call never blocks the event loop, so later prompts still run.
  */
-const CALL_TIMEOUTS_MS = [12_000, 8_000, 4_000, 2_000, 1_000, 1_000];
-/** The most gateway calls one prompt may make, so a bad day cannot exhaust the trial's 60-call cap. */
-const MAX_ATTEMPTS = CALL_TIMEOUTS_MS.length;
+const MAX_ATTEMPTS = 6;
 /** The most refusal rows the optional trail header may carry. */
 const MAX_TRAIL_ROWS = 8;
 
@@ -131,9 +134,9 @@ function isCooling(modelId: string): boolean {
 function markRefusal(modelId: string, status: number): void {
   const count = (failureCounts.get(modelId) ?? 0) + 1;
   failureCounts.set(modelId, count);
-  // A rate limit (429) is cheap to re-probe on a later prompt: it rests one logical call. A wedged
-  // call (timeout or network error) costs the full 12 s, so it rests longer. A 5xx rests in between.
-  // Each further refusal of the same model lengthens the rest, up to a bounded extra.
+  // A rate limit (429) is cheap to re-probe on a later prompt: it rests one logical call. A transport
+  // failure (status 0: no connection, reset) is more expensive, so it rests longer. A 5xx rests in
+  // between. Each further refusal of the same model lengthens the rest, up to a bounded extra.
   const base = status === 429 ? 1 : status === 0 ? 4 : 2;
   const extra = base + Math.min(count - 1, 3);
   coolingUntil.set(modelId, gatewayCalls + extra);
@@ -222,7 +225,6 @@ async function serve(
     tried.add(model.id);
     attempts += 1;
     gatewayCalls += 1;
-    const timeout = CALL_TIMEOUTS_MS[Math.min(attempts - 1, CALL_TIMEOUTS_MS.length - 1)];
 
     let upstream: Response;
     try {
@@ -230,7 +232,6 @@ async function serve(
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${GATEWAY_KEY}` },
         body: JSON.stringify(build(model.id)),
-        signal: AbortSignal.timeout(timeout),
       });
     } catch (err) {
       markRefusal(model.id, 0);
